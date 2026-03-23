@@ -28,6 +28,13 @@ import threading
 from collections import deque
 from datetime import datetime, time, timedelta
 from pathlib import Path
+
+# IST offset — EC2 runs UTC, market runs IST (UTC+5:30)
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+def now_ist():
+    """Current time in IST (Indian Standard Time)."""
+    return datetime.utcnow() + IST_OFFSET
 import numpy as np
 import traceback
 
@@ -324,11 +331,10 @@ class IndicatorEngine:
 
     def get_bb_width(self):
         period = STRADDLE["BB_PERIOD"]
-        today = self.candles[-1]["timestamp"].date() if self.candles else None
-        today_closes = [c["close"] for c in self.candles if c["timestamp"].date() == today]
-        if len(today_closes) < period:
+        if len(self.candles) < period:
             return None
-        closes = np.array(today_closes[-period:])
+        # Use most recent candles (cross-day OK for BB calculation)
+        closes = np.array([c["close"] for c in self.candles[-period:]])
         mid = np.mean(closes)
         std = np.std(closes, ddof=1)
         if mid == 0:
@@ -339,11 +345,9 @@ class IndicatorEngine:
 
     def get_bb_values(self):
         period = V4_PUT["BB_PERIOD"]
-        today = self.candles[-1]["timestamp"].date() if self.candles else None
-        today_closes = [c["close"] for c in self.candles if c["timestamp"].date() == today]
-        if len(today_closes) < period:
+        if len(self.candles) < period:
             return None, None, None
-        closes = np.array(today_closes[-period:])
+        closes = np.array([c["close"] for c in self.candles[-period:]])
         mid = np.mean(closes)
         std = np.std(closes, ddof=1)
         upper = mid + V4_PUT["BB_STD"] * std
@@ -378,13 +382,18 @@ class IndicatorEngine:
 # ──────────────────────────────────────────────────────────────────────
 # BREEZE DATA FETCHER (fallback + warmup)
 # ──────────────────────────────────────────────────────────────────────
+def ist_to_breeze_utc(ist_dt):
+    """Convert IST datetime to UTC ISO string for Breeze API."""
+    utc_dt = ist_dt - IST_OFFSET
+    return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
 def fetch_historical_candles(breeze, from_dt, to_dt):
     """Fetch 5-min NIFTY candles from Breeze historical data API."""
     try:
         data = breeze.get_historical_data_v2(
             interval="5minute",
-            from_date=from_dt.strftime("%Y-%m-%dT07:00:00.000Z"),
-            to_date=to_dt.strftime("%Y-%m-%dT07:00:00.000Z"),
+            from_date=ist_to_breeze_utc(from_dt),
+            to_date=ist_to_breeze_utc(to_dt),
             stock_code="NIFTY",
             exchange_code="NSE",
             product_type="cash",
@@ -410,15 +419,19 @@ def fetch_historical_candles(breeze, from_dt, to_dt):
 
 
 def get_latest_candle(breeze):
-    """Fallback: Fetch the most recent completed 5-min candle via polling."""
-    now = datetime.now()
-    from_dt = now - timedelta(minutes=15)
-    candles = fetch_historical_candles(breeze, from_dt, now)
-    if candles:
-        completed = [c for c in candles if c["timestamp"] + timedelta(minutes=5) <= now]
-        return completed[-1] if completed else None
-    return None
-
+    """Fallback: Get live NIFTY price via get_quotes API."""
+    try:
+        quotes = breeze.get_quotes(stock_code="NIFTY", exchange_code="NSE", product_type="cash")
+        if not quotes or "Success" not in quotes or not quotes["Success"]:
+            return None
+        q = quotes["Success"][0]
+        ltp = float(q["ltp"])
+        if ltp <= 0:
+            return None
+        return {"ltp": ltp, "open": float(q.get("open", ltp)), "high": float(q.get("high", ltp)), "low": float(q.get("low", ltp))}
+    except Exception as e:
+        logger.error("Quote polling error: {}".format(e))
+        return None
 
 # ──────────────────────────────────────────────────────────────────────
 # TRADE PERSISTENCE
@@ -550,15 +563,24 @@ class StraddleEngine:
 
         # ── SIGNAL DETECTION ──
         if not self.in_trading_window(ts):
+            logger.debug("[STRADDLE] ts={} NOT in trading window".format(ts))
             return
         if ts.time() > s["LAST_ENTRY_TIME"]:
+            logger.debug("[STRADDLE] ts={} past LAST_ENTRY_TIME".format(ts))
             return
         if self.cooldown > 0:
+            logger.debug("[STRADDLE] cooldown={}".format(self.cooldown))
             return
 
         atr_ratio = self.indicators.get_atr_ratio()
         range_ratio = self.indicators.get_range_ratio()
         bb_width = self.indicators.get_bb_width()
+        logger.info("[STRADDLE] CHECK ts={} ATR={} Range={} BB={} (need ATR>={} Range>={} BB>={})".format(
+            ts,
+            "{:.2f}".format(atr_ratio) if atr_ratio else "None",
+            "{:.2f}".format(range_ratio) if range_ratio else "None",
+            "{:.4f}".format(bb_width) if bb_width else "None",
+            s["ATR_RATIO_TRIGGER"], s["BREAKOUT_CANDLE_MULT"], s["BB_WIDTH_TRIGGER"]))
 
         if atr_ratio is None or range_ratio is None or bb_width is None:
             return
@@ -758,9 +780,18 @@ class WebSocketFeed:
             if ltp is None:
                 return
 
-            price = float(ltp)
-            volume = int(tick_data.get("ltq", tick_data.get("volume", 0)))
-            tick_time = datetime.now()  # use local time for tick timestamp
+            try:
+                price = float(ltp)
+            except (ValueError, TypeError):
+                return
+            if price <= 0:
+                return
+            vol_raw = tick_data.get("ltq", tick_data.get("volume", 0))
+            try:
+                volume = int(vol_raw) if vol_raw != "" else 0
+            except (ValueError, TypeError):
+                volume = 0
+            tick_time = now_ist()  # IST time for tick timestamp
 
             self.tick_count += 1
             self.last_tick_time = tick_time
@@ -826,7 +857,7 @@ class WebSocketFeed:
         if not self.connected or self.last_tick_time is None:
             return False
         # Consider unhealthy if no tick in last 30 seconds during market hours
-        now = datetime.now()
+        now = now_ist()
         if MARKET_OPEN <= now.time() <= time(15, 30):
             return (now - self.last_tick_time).total_seconds() < 30
         return True
@@ -861,11 +892,18 @@ def run_bot(session_token):
 
     # Load warmup candles (last 5 days for indicator warmup)
     logger.info("Loading warmup candles...")
-    warmup_start = datetime.now() - timedelta(days=5)
-    warmup_candles = fetch_historical_candles(breeze, warmup_start, datetime.now())
+    warmup_start = now_ist() - timedelta(days=5)
+    warmup_candles = fetch_historical_candles(breeze, warmup_start, now_ist())
     for c in warmup_candles:
         indicators.add_candle(c)
-    logger.info("Loaded {} warmup candles — indicators ready".format(len(warmup_candles)))
+        # Also feed into candle builder so BB has full history at startup
+        candle_builder.on_tick(c["close"], c.get("volume", 0), c["timestamp"])
+    # Force-complete the last warmup candle so builder starts fresh for live data
+    if warmup_candles:
+        candle_builder.current_candle = None
+        candle_builder.tick_count = 0
+    logger.info("Loaded {} warmup candles — indicators + candle builder ready".format(len(warmup_candles)))
+    logger.info("BB available at startup: {}".format(indicators.get_bb_width() is not None))
 
     # Connect WebSocket for live streaming
     ws_feed = WebSocketFeed(breeze, candle_builder)
@@ -887,7 +925,7 @@ def run_bot(session_token):
     logger.info("Bot running — monitoring NIFTY...")
 
     while True:
-        now = datetime.now()
+        now = now_ist()
 
         # ── PRE-MARKET ──
         if now.time() < MARKET_OPEN:
@@ -915,26 +953,32 @@ def run_bot(session_token):
 
         new_candle = None
 
-        # METHOD 1: WebSocket — check if candle builder has a new completed candle
-        if ws_feed.connected:
-            # Check WebSocket health
-            if not ws_feed.is_healthy():
-                logger.warning("WebSocket stale — attempting reconnect...")
-                ws_feed.reconnect()
+        # METHOD 1: WebSocket — DISABLED (unreliable on Breeze)
+        # Check for completed candles from candle builder (fed by polling)
+        if candle_builder.completed_candles:
+            new_candle = candle_builder.completed_candles.popleft()
 
-            # Check for completed candles from WS
-            if candle_builder.completed_candles:
-                new_candle = candle_builder.completed_candles.popleft()
-
-        # METHOD 2: Polling fallback — if no WS or WS has no new data
-        if new_candle is None and (not ws_feed.connected or
-                (last_poll_time is None or (now - last_poll_time).total_seconds() >= poll_interval)):
+        # METHOD 2: Quote-based polling — primary data source
+        if last_poll_time is None or (now - last_poll_time).total_seconds() >= poll_interval:
             try:
-                polled_candle = get_latest_candle(breeze)
-                if polled_candle is not None:
-                    candle_time = polled_candle["timestamp"]
-                    if last_processed_candle_time is None or candle_time > last_processed_candle_time:
-                        new_candle = polled_candle
+                quote_data = get_latest_candle(breeze)
+                if quote_data is not None:
+                    ltp = quote_data["ltp"]
+                    # Feed into candle builder just like a WebSocket tick
+                    completed = candle_builder.on_tick(ltp, 0, now)
+                    if candle_builder.tick_count % 12 == 1:  # log every ~1 min
+                        cur = candle_builder.current_candle
+                        logger.info("POLL TICK #{}: LTP={:.0f} now={} candle_start={} O={:.0f} H={:.0f} L={:.0f} C={:.0f}".format(
+                            candle_builder.tick_count, ltp, now.strftime("%H:%M:%S"),
+                            cur["timestamp"].strftime("%H:%M") if cur else "None",
+                            cur["open"] if cur else 0, cur["high"] if cur else 0,
+                            cur["low"] if cur else 0, cur["close"] if cur else 0))
+                    if completed is not None:
+                        new_candle = completed
+                        logger.info("POLL CANDLE COMPLETE: {} | O={:.0f} H={:.0f} L={:.0f} C={:.0f}".format(
+                            completed["timestamp"].strftime("%H:%M"),
+                            completed["open"], completed["high"],
+                            completed["low"], completed["close"]))
                 last_poll_time = now
             except Exception as e:
                 logger.error("Polling error: {}".format(e))
@@ -988,7 +1032,7 @@ def _send_daily_summary(straddle_engine, v4_put_engine, trades_data, indicators)
     latest = indicators.get_latest()
 
     notify_daily_summary({
-        "date": datetime.now().strftime("%d %b %Y"),
+        "date": now_ist().strftime("%d %b %Y"),
         "straddle_trades": len(straddle_trades),
         "v4_trades": len(v4_trades),
         "winners": sum(1 for t in all_trades if t.net_pnl > 0),
